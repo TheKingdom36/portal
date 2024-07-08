@@ -9,24 +9,29 @@ use http_body_util::Empty;
 use hyper::StatusCode;
 use hyper_util::rt::TokioIo;
 use oas3::Spec;
-use serde::{Deserialize, Serialize};
-use std::env;
-use std::io::Error as IOError;
-use tokio::{net::TcpStream, stream};
+use serde::Serialize;
+use std::{borrow::BorrowMut, env, io::Error as IOError};
+use tokio::net::TcpStream;
 use tower_http::trace::TraceLayer;
+use tracing::{debug, info, instrument};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() {
     // this method needs to be inside main() method
-    env::set_var("RUST_BACKTRACE", "1");
+    env::set_var("RUST_BACKTRACE", "full");
 
     let spec =
         oas3::from_path("./resources/OpenAPISpecExamples/pet_store.json".to_string()).unwrap();
 
     //Need to read the openapi spec and save the results into useable objects
 
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
     let app = Router::new()
-        .route("/", get(handler_segments))
+        .route("/*key", get(handler_segments))
         .layer(
             TraceLayer::new_for_http()
                 // Create our own span for the request and include the matched path. The matched
@@ -41,7 +46,7 @@ async fn main() {
                         .get::<MatchedPath>()
                         .map(|matched_path| matched_path.as_str());
 
-                    tracing::debug_span!("request", %method, %uri, matched_path)
+                    tracing::error_span!("request", %method, %uri, matched_path)
                 })
                 // By default `TraceLayer` will log 5xx responses but we're doing our specific
                 // logging of errors so disable that
@@ -52,39 +57,61 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8000")
         .await
         .unwrap();
-    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    debug!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }
 
+#[instrument(skip_all)]
 async fn handler_segments(State(spec): State<Spec>, req: Request) -> Result<Response, AppError> {
     let path = req.uri().path();
+    let paths = spec.paths.unwrap_or_default();
 
-    match spec.paths.contains_key(path) {
-        true => println!("true-{}", &path),
-        false => println!("false-{}", &path),
+    let path_item_option = paths.get(path);
+
+    if path_item_option.is_none() {
+        return Err(AppError::OpenApiRejection(OpenapiError {
+            message: "No valid path was found".to_string(),
+        }));
     }
 
-    let url = "http://localhost:3000".parse::<hyper::Uri>().unwrap();
+    let path_item = path_item_option.unwrap();
 
-    let host = url.host().expect("uri has no host");
-    let port = url.port_u16().unwrap_or(80);
+    let url = path_item.extensions.get("forward-server");
+    if url.is_none() {
+        return Err(AppError::OpenApiRejection(OpenapiError {
+            message: "No valid URL Provided".to_string(),
+        }));
+    }
+
+    let mut url_string = "http://".to_owned();
+    let u = url.unwrap().as_str().unwrap_or_default();
+    url_string.push_str(u);
+
+    let url_hyper = match url_string.parse::<hyper::Uri>() {
+        Ok(value) => value,
+        Err(err) => {
+            println!("some error occured blah blah: {err}");
+            return Err(AppError::OpenApiRejection(OpenapiError {
+                message: err.to_string(),
+            }));
+        }
+    };
+
+    let host = url_hyper.host().expect("uri has no host");
+    let port = url_hyper.port_u16().unwrap_or(80);
 
     let address = format!("{}:{}", host, port);
 
-    println!("Address: {}", address);
-
-    //let stream = TcpStream::connect(address).await;
+    info!("Createing connection to: {}", address);
 
     // Use an adapter to access something implementing `tokio::io` traits as if they implement
     // `hyper::rt` IO traits.
-
-    let mut stream = TcpStream::connect(address).await?;
-
-    let io = TokioIo::new(stream);
-
-    let handshake_result = hyper::client::conn::http1::handshake(io).await;
-
-    let (mut sender, conn) = handshake_result.unwrap();
+    info!("Completed connection");
+    let (mut sender, conn) = TcpStream::connect(address)
+        .await
+        .and_then(|stream| Ok(TokioIo::new(stream)))
+        .and_then(|io| Ok(async { hyper::client::conn::http1::handshake(io).await }))?
+        .await?;
 
     // Spawn a task to poll the connection, driving the HTTP state
     tokio::task::spawn(async move {
@@ -93,14 +120,15 @@ async fn handler_segments(State(spec): State<Spec>, req: Request) -> Result<Resp
         }
     });
 
+    let mut body = req.body().clone();
     // Create an HTTP request with an empty body and a HOST header
     let req = Request::builder()
-        .uri(url)
-        .method("GET")
-        .body(Empty::<Bytes>::new())
+        .uri(url_hyper)
+        .method(req.method())
+        .body(body)
         .unwrap();
 
-    println!("Req status: {:?}", req);
+    tracing::debug!("Req status: {:?}", req);
 
     // Await the response...
     let mut res = match sender.send_request(req).await {
@@ -113,12 +141,19 @@ async fn handler_segments(State(spec): State<Spec>, req: Request) -> Result<Resp
     Ok(res.into_response())
 }
 
+#[derive(Debug)]
+struct OpenapiError {
+    message: String,
+}
+
 // The kinds of errors we can hit in our application.
+#[derive(Debug)]
 enum AppError {
     // The request body contained invalid JSON
     JsonRejection(JsonRejection),
     HyperRejection(hyper::Error),
     IORejection(IOError),
+    OpenApiRejection(OpenapiError),
 }
 
 // Tell axum how `AppError` should be converted into a response.
@@ -142,15 +177,21 @@ impl IntoResponse for AppError {
 
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "Something went wrong".to_owned(),
+                    "There was an issue communicating with external services please try again later".to_owned(),
                 )
             }
             AppError::IORejection(err) => {
-                tracing::error!(%err, "error from hyper");
-
+                tracing::error!(%err, "error from IO");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "Something went wrong".to_owned(),
+                    "Something went wrong io ".to_owned(),
+                )
+            }
+            AppError::OpenApiRejection(err) => {
+                tracing::error!("{:?}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Something went wrong OpenAPI ".to_owned(),
                 )
             }
         };
@@ -176,11 +217,6 @@ impl From<IOError> for AppError {
         Self::IORejection(error)
     }
 }
-
-// Create our own JSON extractor by wrapping `axum::Json`. This makes it easy to override the
-// rejection and provide our own which formats errors to match our application.
-//
-// `axum::Json` responds with plain text if the input is invalid
 
 struct AppJson<T>(T);
 

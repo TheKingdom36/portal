@@ -13,7 +13,7 @@ http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["full"] }
 tracing = "0.1"
 bytes = "1.6.0"
-oas3 = "0.4"
+oas3 = "0.7"
 tower-http = {version="0.5.2",features = ["trace"]}
 serde = "1.0.203"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
