@@ -14,7 +14,7 @@
   ],
   "paths": {
     "/pets": {
-      "x-forward-server": "127.0.0.1:3000",
+      "x-forward-server": "localhost:3000",
       "get": {
         "summary": "List all pets",
         "operationId": "listPets",

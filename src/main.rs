@@ -1,16 +1,19 @@
 use axum::{
-    extract::{rejection::JsonRejection, FromRequest, MatchedPath, Request, State},
+    extract::{rejection::JsonRejection, MatchedPath, Request, State},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
-use bytes::Bytes;
 use http_body_util::Empty;
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use hyper_util::rt::TokioIo;
 use oas3::Spec;
 use serde::Serialize;
-use std::{borrow::BorrowMut, env, io::Error as IOError};
+use std::{
+    borrow::{Borrow, BorrowMut},
+    env,
+    io::Error as IOError,
+};
 use tokio::net::TcpStream;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, instrument};
@@ -20,6 +23,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 async fn main() {
     // this method needs to be inside main() method
     env::set_var("RUST_BACKTRACE", "full");
+
+    let args: Vec<String> = env::args().collect();
+    println!("{:?}", args);
 
     let spec =
         oas3::from_path("./resources/OpenAPISpecExamples/pet_store.json".to_string()).unwrap();
@@ -102,17 +108,19 @@ async fn handler_segments(State(spec): State<Spec>, req: Request) -> Result<Resp
 
     let address = format!("{}:{}", host, port);
 
-    info!("Createing connection to: {}", address);
+    tracing::debug!("Createing connection to: {:?}", address);
+
+    tracing::debug!("Completed connection");
+
+    // Open a TCP connection to the remote host
+    let stream = TcpStream::connect(address).await?;
 
     // Use an adapter to access something implementing `tokio::io` traits as if they implement
     // `hyper::rt` IO traits.
-    info!("Completed connection");
-    let (mut sender, conn) = TcpStream::connect(address)
-        .await
-        .and_then(|stream| Ok(TokioIo::new(stream)))
-        .and_then(|io| Ok(async { hyper::client::conn::http1::handshake(io).await }))?
-        .await?;
+    let io = TokioIo::new(stream);
 
+    // Create the Hyper client
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     // Spawn a task to poll the connection, driving the HTTP state
     tokio::task::spawn(async move {
         if let Err(err) = conn.await {
@@ -120,21 +128,17 @@ async fn handler_segments(State(spec): State<Spec>, req: Request) -> Result<Resp
         }
     });
 
-    let mut body = req.body().clone();
     // Create an HTTP request with an empty body and a HOST header
-    let req = Request::builder()
-        .uri(url_hyper)
+    let hyper_req = Request::builder()
+        .uri(req.uri())
         .method(req.method())
-        .body(body)
+        .body(req.into_body())
         .unwrap();
 
-    tracing::debug!("Req status: {:?}", req);
+    tracing::debug!("Req status: {:?}", hyper_req);
 
     // Await the response...
-    let mut res = match sender.send_request(req).await {
-        Ok(value) => println!("Result:"),
-        Err(error) => println!("Error: {}", error),
-    };
+    let mut res = sender.send_request(hyper_req).await.unwrap();
 
     println!("Response status: {:?}", res);
 
